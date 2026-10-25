@@ -41,8 +41,7 @@ def login():
 @st.cache_data(ttl=12 * 3600, show_spinner="Symbol list load ho rahi hai...")
 def scrip_master():
     data = requests.get(SCRIP_URL, timeout=90).json()
-    df = pd.DataFrame(data)[["token", "symbol", "name", "exch_seg"]]
-    return df
+    return pd.DataFrame(data)[["token", "symbol", "name", "exch_seg"]]
 
 
 @st.cache_data(ttl=45, show_spinner=False)
@@ -109,6 +108,37 @@ def build_targets(stocks, custom):
     return t
 
 
+@st.cache_data(ttl=55, show_spinner=False)
+def scan(targets, tfs):
+    rows = []
+    for name, ex, tok in targets:
+        for tf in tfs:
+            try:
+                df = get_candles(ex, tok, tf)
+                if df is None or len(df) < 30:
+                    continue
+                out = key_levels(df)
+                if not out:
+                    continue
+                levels, band = out
+                ltp = float(df["close"].iloc[-1])
+                lo, hi = levels[0], levels[-1]
+                if lo[0] - band <= ltp <= lo[0] + band:
+                    z, lv = "🟢 BUY", lo
+                elif hi[0] - band <= ltp <= hi[0] + band:
+                    z, lv = "🔴 SELL", hi
+                else:
+                    continue
+                rows.append({"Symbol": name, "TF": tf, "Zone": z,
+                             "LTP": round(ltp, 2), "Level": round(lv[0], 2),
+                             "Strength%": round(lv[1]),
+                             "Dist%": round((ltp - lv[0]) / lv[0] * 100, 2),
+                             "ex": ex, "tok": tok})
+            except Exception:
+                continue
+    return rows
+
+
 st.title("📊 Key Levels Scanner")
 
 try:
@@ -117,7 +147,7 @@ except Exception as e:
     st.error(f"Angel One login fail: {e}")
     st.stop()
 
-with st.expander("⚙️ Settings", expanded=True):
+with st.expander("⚙️ Settings", expanded=False):
     st.multiselect("Index", list(INDICES), default=["NIFTY", "BANKNIFTY"], key="idx_pick")
     m = scrip_master()
     names = sorted(m[(m.exch_seg == "NSE") & (m.symbol.str.endswith("-EQ"))].name.unique())
@@ -131,76 +161,84 @@ with st.expander("⚙️ Settings", expanded=True):
             r = f[f.symbol == s].iloc[0]
             custom[s] = (r.exch_seg, r.token)
     tfs = st.multiselect("Timeframe", list(TF), default=["5m", "15m", "1h", "1D"])
-    auto = st.checkbox("Auto-refresh (60 sec)")
+    auto = st.checkbox("Auto-refresh (60 sec)", value=True)
 
 if auto:
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=60000, key="ar")
 
-go_scan = st.button("🔍 Scan karo", use_container_width=True, type="primary")
+if st.button("🔄 Abhi scan karo", use_container_width=True, type="primary"):
+    scan.clear()
 
-if go_scan or (auto and "rows" in st.session_state):
-    targets = build_targets(stocks, custom)
-    rows, bar = [], st.progress(0.0)
-    total = max(len(targets) * len(tfs), 1)
-    done = 0
-    for name, (ex, tok) in targets.items():
-        for tf in tfs:
-            done += 1
-            bar.progress(done / total, text=f"{name} {tf}")
-            try:
-                df = get_candles(ex, tok, tf)
-                if df is None or len(df) < 30:
-                    continue
-                out = key_levels(df)
-                if not out:
-                    continue
-                levels, band = out
-                ltp = float(df["close"].iloc[-1])
-                lo, hi = levels[0], levels[-1]
-                if lo[0] - band <= ltp <= lo[0] + band:
-                    z, lv = "BUY", lo
-                elif hi[0] - band <= ltp <= hi[0] + band:
-                    z, lv = "SELL", hi
-                else:
-                    continue
-                rows.append({"Symbol": name, "TF": tf, "Zone": z,
-                             "LTP": round(ltp, 2), "Level": round(lv[0], 2),
-                             "Strength%": round(lv[1]),
-                             "Dist%": round((ltp - lv[0]) / lv[0] * 100, 2),
-                             "ex": ex, "tok": tok})
-            except Exception:
-                continue
-    bar.empty()
-    st.session_state["rows"] = rows
+targets = build_targets(stocks, custom)
+tgt = tuple((n, ex, tok) for n, (ex, tok) in targets.items())
 
-rows = st.session_state.get("rows")
-if rows is not None:
-    res = pd.DataFrame(rows)
+with st.spinner("Scan ho raha hai..."):
+    rows = scan(tgt, tuple(tfs))
+
+now_ist = dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
+st.caption(f"Last update: {now_ist.strftime('%H:%M:%S')}")
+
+res = pd.DataFrame(rows)
+
+# Timeframe buttons
+opts = ["All"] + list(tfs)
+
+
+def lab(x):
     if res.empty:
-        st.info("Abhi koi stock yellow/red zone mein nahi hai.")
-    else:
-        show = ["Symbol", "TF", "LTP", "Level", "Strength%", "Dist%"]
-        st.success(f"🟢 BUY ZONE (yellow): {(res.Zone == 'BUY').sum()}")
-        st.dataframe(res[res.Zone == "BUY"][show], use_container_width=True, hide_index=True)
-        st.error(f"🔴 SELL ZONE (red): {(res.Zone == 'SELL').sum()}")
-        st.dataframe(res[res.Zone == "SELL"][show], use_container_width=True, hide_index=True)
+        return x
+    n = len(res) if x == "All" else int((res.TF == x).sum())
+    return f"{x} ({n})"
+
+
+tf_pick = st.radio("Timeframe chuno", opts, format_func=lab, horizontal=True)
+zone_pick = st.radio("Zone", ["Sab", "🟢 BUY", "🔴 SELL"], horizontal=True)
+
+view = res.copy()
+if not view.empty:
+    if tf_pick != "All":
+        view = view[view.TF == tf_pick]
+    if zone_pick != "Sab":
+        view = view[view.Zone == zone_pick]
+    view = view.sort_values(["Zone", "Symbol"]).reset_index(drop=True)
+
+if view.empty:
+    st.info("Is selection mein koi stock yellow/red zone mein nahi hai.")
+else:
+    c1, c2 = st.columns(2)
+    c1.metric("🟢 BUY zone", int((view.Zone == "🟢 BUY").sum()))
+    c2.metric("🔴 SELL zone", int((view.Zone == "🔴 SELL").sum()))
+    st.caption("👇 Chart kholne ke liye row par tap karo")
+    cols = ["Symbol", "TF", "Zone", "LTP", "Level", "Strength%", "Dist%"]
+    ev = st.dataframe(view[cols], use_container_width=True, hide_index=True,
+                      on_select="rerun", selection_mode="single-row", key="tbl")
+    if ev.selection.rows:
+        r = view.iloc[ev.selection.rows[0]]
+        new = (r.Symbol, r.ex, r.tok, r.TF)
+        if st.session_state.get("sel") != new:
+            st.session_state["sel"] = new
+            st.session_state["chart_tf"] = r.TF
 
 st.divider()
 st.subheader("📈 Chart")
-all_t = build_targets(stocks, custom)
-if all_t:
-    c1, c2 = st.columns(2)
-    sym = c1.selectbox("Symbol", list(all_t))
-    tf = c2.selectbox("Timeframe ", list(TF), index=2)
-    ex, tok = all_t[sym]
-    df = get_candles(ex, tok, tf)
+
+sel = st.session_state.get("sel")
+if not sel and targets:
+    n0 = list(targets)[0]
+    sel = (n0, targets[n0][0], targets[n0][1], tfs[0] if tfs else "15m")
+    st.session_state.setdefault("chart_tf", sel[3])
+
+if sel:
+    sym, ex, tok, _ = sel
+    ctf = st.radio("Chart timeframe", list(TF), horizontal=True, key="chart_tf")
+    st.markdown(f"**{sym}** · {ctf}")
+    df = get_candles(ex, tok, ctf)
     if df is not None and len(df) > 30:
         out = key_levels(df)
-        view = df.tail(150)
+        v = df.tail(150)
         fig = go.Figure(go.Candlestick(
-            x=view.time, open=view.open, high=view.high,
-            low=view.low, close=view.close))
+            x=v.time, open=v.open, high=v.high, low=v.low, close=v.close))
         if out:
             levels, band = out
             colors = ["#FFD700", "#1E90FF", "#FFA500", "#FF3B3B"]
@@ -213,5 +251,7 @@ if all_t:
                           xaxis_rangeslider_visible=False,
                           margin=dict(l=0, r=0, t=10, b=0))
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Is timeframe ka data nahi mila.")
 
 st.caption("Sirf analysis tool hai. Trade se pehle khud confirm karein.")
