@@ -1,0 +1,12 @@
+streamlit
+smartapi-python
+pyotp
+logzero
+websocket-client
+requests
+pandas
+numpy
+plotly
+scikit-learn
+streamlit-autorefresh
+setuptools<81
